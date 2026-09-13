@@ -20,7 +20,7 @@ third of the frame carries the subject. Those are the numbers that separate a
 thumbnail that gets clicked from one that gets scrolled past -- and unlike
 "it looks punchy", you can sort by them.
 """
-import argparse, colorsys, csv, glob, os, re, sys, urllib.request
+import argparse, colorsys, csv, glob, os, re, subprocess, sys, urllib.request
 from collections import Counter
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -70,30 +70,66 @@ def fetch(src, outdir):
     if not ids:
         raise SystemExit(f"no video ids found in {src}")
 
-    ok = 0
+    # python.org macOS builds ship without a usable CA store until you run
+    # /Applications/Python\ 3.x/Install\ Certificates.command, so prefer certifi
+    ctx = None
+    try:
+        import certifi, ssl
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+
+    def via_urllib(url):
+        req = urllib.request.Request(url, headers=UA)
+        with urllib.request.urlopen(req, timeout=20, context=ctx) as r:
+            return r.read()
+
+    def via_curl(url):
+        """Fallback: curl uses the system trust store and works where the
+        python.org build's SSL does not."""
+        out = subprocess.run(["curl", "-sSL", "--max-time", "25", "-A", UA["User-Agent"], url],
+                             capture_output=True)
+        if out.returncode != 0:
+            raise RuntimeError((out.stderr or b"").decode()[:160] or f"curl exit {out.returncode}")
+        return out.stdout
+
+    ok, first_err = 0, None
     for vid in ids:
         dest = os.path.join(outdir, f"{vid}.jpg")
-        if os.path.exists(dest):
+        if os.path.exists(dest) and os.path.getsize(dest) > 2000:
+            print(f"{vid}  already have it")
             ok += 1
             continue
+        err = None
         for name in LADDER:
             url = f"https://i.ytimg.com/vi/{vid}/{name}.jpg"
-            try:
-                req = urllib.request.Request(url, headers=UA)
-                with urllib.request.urlopen(req, timeout=20) as r:
-                    data = r.read()
-                # YouTube serves a 120x90 grey placeholder instead of 404
-                if len(data) < 2000:
-                    continue
-                open(dest, "wb").write(data)
-                print(f"{vid}  {name}  {len(data)//1024}kb")
-                ok += 1
-                break
-            except Exception:
+            data = None
+            for getter in (via_urllib, via_curl):
+                try:
+                    data = getter(url)
+                    break
+                except Exception as e:
+                    err = f"{type(e).__name__}: {e}"
+            if data is None:
                 continue
+            # YouTube serves a small grey placeholder rather than a 404
+            if len(data) < 2000:
+                err = f"placeholder only ({len(data)} bytes)"
+                continue
+            open(dest, "wb").write(data)
+            print(f"{vid}  {name}  {len(data)//1024}kb")
+            ok += 1
+            break
         else:
-            print(f"{vid}  NO THUMBNAIL")
+            print(f"{vid}  NO THUMBNAIL  <- {err}")
+            first_err = first_err or err
     print(f"\n{ok}/{len(ids)} downloaded to {outdir}")
+    if ok == 0 and first_err:
+        print(f"\nEvery attempt failed with: {first_err}")
+        if "CERTIFICATE" in first_err.upper() or "SSL" in first_err.upper():
+            print("That is the macOS python.org certificate problem. Fix it with:")
+            print('  /Applications/Python\\ 3.14/Install\\ Certificates.command')
+            print("  (or: pip3 install certifi, then re-run)")
 
 
 # ----------------------------------------------------------------- scan ----
