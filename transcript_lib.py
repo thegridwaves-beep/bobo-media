@@ -18,6 +18,8 @@ from youtube_transcript_api import (
     YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound,
     VideoUnavailable, IpBlocked, RequestBlocked, PoTokenRequired, InvalidVideoId,
 )
+from youtube_transcript_api.formatters import SRTFormatter
+from youtube_transcript_api.proxies import GenericProxyConfig, WebshareProxyConfig
 
 # anchored on real URL markers -- a bare "/" alternative matches any 11-char
 # path segment and silently pulls the wrong id out of wrapper links
@@ -35,33 +37,19 @@ def extract_video_id(s: str) -> str | None:
     return m.group(1) if m else None
 
 
-def ts(t: float) -> str:
-    ms = int(round(t * 1000))
-    h, ms = divmod(ms, 3600000)
-    m, ms = divmod(ms, 60000)
-    s, ms = divmod(ms, 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+SRT = SRTFormatter()
 
 
 def fetch_one(api, vid, languages, outdir):
     # v1.x is instance-based: the old YouTubeTranscriptApi.get_transcript
     # static method was removed, and snippets are objects, not dicts.
     fetched = api.fetch(vid, languages=languages)
-    rows = fetched.to_raw_data()          # [{'text','start','duration'}, ...]
-    if not rows:
+    if not len(fetched):
         raise RuntimeError("empty transcript")
-
-    srt = []
-    for i, r in enumerate(rows, 1):
-        start = r["start"]
-        end = start + r.get("duration", 0)
-        text = re.sub(r"\s+", " ", r["text"]).strip()
-        if not text:
-            continue
-        srt.append(f"{i}\n{ts(start)} --> {ts(end)}\n{text}\n")
-    path = os.path.join(outdir, f"{vid}.en.srt")
-    open(path, "w", encoding="utf-8").write("\n".join(srt))
-    return len(rows), rows[-1]["start"] + rows[-1].get("duration", 0)
+    path = os.path.join(outdir, f"{vid}.{fetched.language_code}.srt")
+    open(path, "w", encoding="utf-8").write(SRT.format_transcript(fetched))
+    last = fetched[-1]
+    return len(fetched), last.start + last.duration, fetched.is_generated, fetched.language_code
 
 
 def main():
@@ -70,6 +58,10 @@ def main():
     ap.add_argument("-o", "--out", default="raw")
     ap.add_argument("--lang", default="en")
     ap.add_argument("--sleep", type=float, default=1.5)
+    ap.add_argument("--http-proxy", help="e.g. http://user:pass@host:port")
+    ap.add_argument("--https-proxy")
+    ap.add_argument("--webshare-user", help="Webshare rotating RESIDENTIAL proxy username")
+    ap.add_argument("--webshare-pass")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
 
@@ -85,19 +77,30 @@ def main():
     if not ids:
         sys.exit(f"no video ids found in {a.src}")
 
-    api = YouTubeTranscriptApi()
+    proxy = None
+    if a.webshare_user and a.webshare_pass:
+        proxy = WebshareProxyConfig(proxy_username=a.webshare_user,
+                                    proxy_password=a.webshare_pass)
+        print("routing through Webshare residential proxies")
+    elif a.http_proxy or a.https_proxy:
+        proxy = GenericProxyConfig(http_url=a.http_proxy,
+                                   https_url=a.https_proxy or a.http_proxy)
+        print("routing through the supplied proxy")
+    api = YouTubeTranscriptApi(proxy_config=proxy) if proxy else YouTubeTranscriptApi()
     print(f"{len(ids)} videos -> {a.out}/\n")
     ok, failed, blocked = 0, [], False
 
     for i, vid in enumerate(ids, 1):
-        dest = os.path.join(a.out, f"{vid}.en.srt")
-        if os.path.exists(dest):
+        if any(os.path.exists(os.path.join(a.out, f"{vid}.{c}.srt"))
+               for c in (a.lang, "en", "en-US", "en-GB")):
             print(f"[{i}/{len(ids)}] {vid}  already have it, skipping")
             ok += 1
             continue
         try:
-            n, dur = fetch_one(api, vid, [a.lang], a.out)
-            print(f"[{i}/{len(ids)}] {vid}  {n:>4} cues  {int(dur)//60}:{int(dur)%60:02d}")
+            n, dur, gen, code = fetch_one(api, vid, [a.lang], a.out)
+            print(f"[{i}/{len(ids)}] {vid}  {n:>4} cues  "
+                  f"{int(dur)//60}:{int(dur)%60:02d}  "
+                  f"{'auto' if gen else 'manual'}/{code}")
             ok += 1
         except (IpBlocked, RequestBlocked):
             print(f"[{i}/{len(ids)}] {vid}  BLOCKED -- YouTube is refusing this IP")
@@ -123,8 +126,9 @@ def main():
 
     print(f"\n{ok}/{len(ids)} transcripts in {a.out}/")
     if blocked:
-        print("\nYouTube blocked the IP. You are probably on a VPN or office network --\n"
-              "turn the VPN off and re-run, or fall back to transcript.py.")
+        print("\nYouTube blocked this IP. Turn off any VPN and re-run, or fall back to\n"
+              "transcript.py. If you ever need this on a server, pass --http-proxy or\n"
+              "--webshare-user/--webshare-pass: cloud IPs are blocked by default.")
     if failed:
         print("failed:", " ".join(failed), "\nRe-run to retry only these.")
 
