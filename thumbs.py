@@ -20,13 +20,27 @@ third of the frame carries the subject. Those are the numbers that separate a
 thumbnail that gets clicked from one that gets scrolled past -- and unlike
 "it looks punchy", you can sort by them.
 """
-import argparse, colorsys, csv, glob, os, sys, urllib.request
+import argparse, colorsys, csv, glob, os, re, sys, urllib.request
 from collections import Counter
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 LADDER = ["maxresdefault", "sddefault", "hqdefault", "mqdefault"]
 UA = {"User-Agent": "Mozilla/5.0"}
+
+ID_RE = re.compile(r"(?:v=|/shorts/|youtu\.be/|/live/|/embed/)([A-Za-z0-9_-]{11})")
+BARE_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def vid_of(line):
+    """Accept a bare id, any YouTube URL shape, or either with extra columns."""
+    s = re.split(r"[\t, ]", line.strip(), maxsplit=1)[0]
+    for a, b in (("%3D", "="), ("%3F", "?"), ("%2F", "/")):
+        s = s.replace(a, b).replace(a.lower(), b)
+    if BARE_RE.match(s):
+        return s
+    m = ID_RE.search(s)
+    return m.group(1) if m else None
 
 FONT_B = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
 
@@ -41,12 +55,20 @@ def _font(size):
 # ---------------------------------------------------------------- fetch ----
 def fetch(src, outdir):
     os.makedirs(outdir, exist_ok=True)
-    ids = []
+    ids, seen = [], set()
     if src.endswith(".csv"):
-        for row in csv.DictReader(open(src, encoding="utf-8")):
-            ids.append(row["video_id"])
+        lines = [r["video_id"] for r in csv.DictReader(open(src, encoding="utf-8"))]
     else:
-        ids = [l.strip() for l in open(src) if l.strip() and not l.startswith("#")]
+        lines = list(open(src, encoding="utf-8"))
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        v = vid_of(line)
+        if v and v not in seen:
+            seen.add(v)
+            ids.append(v)
+    if not ids:
+        raise SystemExit(f"no video ids found in {src}")
 
     ok = 0
     for vid in ids:
